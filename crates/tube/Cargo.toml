@@ -1,0 +1,8 @@
+[package]
+name = "tube"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.89"
+tube-inotify = { version = "0.1.0", path = "../tube-inotify" }
