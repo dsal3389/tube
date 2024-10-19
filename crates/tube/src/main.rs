@@ -5,8 +5,7 @@ use tube_inotify::{Flag, Inotify, Mask};
 async fn main() -> anyhow::Result<()> {
     let mut inotify = Inotify::with_flags(Flag::NONBLOCKING)
         .expect("couldn't create inotify")
-        .watch("test.file".into(), Mask::OPEN | Mask::CLOSE)?
-        .watch("Cargo.lock".into(), Mask::OPEN)?;
+        .watch("foo".into(), Mask::CREATE | Mask::DELETE)?;
     println!("Hello, world!");
 
     while let Some(events) = inotify.next().await {

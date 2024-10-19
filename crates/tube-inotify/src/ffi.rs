@@ -7,6 +7,8 @@ pub const IN_CLOSE_WRITE: u32 = 0x00000008;
 pub const IN_CLOSE_NOWRITE: u32 = 0x00000010;
 pub const IN_OPEN: u32 = 0x00000020;
 pub const IN_CLOSE: u32 = IN_CLOSE_WRITE | IN_CLOSE_NOWRITE;
+pub const IN_CREATE: u32 = 0x00000100;
+pub const IN_DELETE: u32 = 0x00000200;
 
 pub type nfds_t = c_ulong;
 

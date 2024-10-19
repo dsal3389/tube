@@ -1,7 +1,9 @@
 use futures::stream::Stream;
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -16,8 +18,12 @@ pub const SYSCALL_ERROR: i32 = -1;
 pub struct Mask;
 
 impl Mask {
+    pub const CREATE: u32 = ffi::IN_CREATE;
+    pub const DELETE: u32 = ffi::IN_DELETE;
     pub const OPEN: u32 = ffi::IN_OPEN;
     pub const CLOSE: u32 = ffi::IN_CLOSE;
+    pub const CLOSE_WRITE: u32 = ffi::IN_CLOSE_WRITE;
+    pub const CLOSE_NOWRITE: u32 = ffi::IN_CLOSE_NOWRITE;
 }
 
 pub struct Flag;
@@ -26,24 +32,17 @@ impl Flag {
     pub const NONBLOCKING: i32 = ffi::IN_NONBLOCK;
 }
 
+/// a single InotifyEvent, those events are returned by `InotifyEventBatch`
+/// when iterating over it
 #[derive(Debug)]
 pub struct InotifyEvent {
     wd: RawFd,
     mask: u32,
     cookie: u32,
-    name: String,
+    name: Option<OsString>,
 }
 
 impl InotifyEvent {
-    fn new(wd: RawFd, mask: u32, cookie: u32, name: String) -> Self {
-        Self {
-            wd,
-            mask,
-            cookie,
-            name,
-        }
-    }
-
     /// returns `InotifyEvent` from given silice, because the `name` field can be dynamic
     /// function also returns the size in bytes of the event, in case the original buffer
     /// contains multiple events and the caller to `from_buffer` need to know the size in buffer
@@ -63,17 +62,23 @@ impl InotifyEvent {
         // the `ffi_event.len` defines the length of the name string, so we
         // take a slice from the end of the event until the event_size + len
         // which should be the end of name string
-        let name_bytes = &buffer[event_size..event_end];
+        let name = buffer[event_size..event_end]
+            .splitn(2, |c| c == &0u8)
+            .map(|s| OsStr::from_bytes(s).to_os_string())
+            .next();
 
-        // convert the string to a higher level `String`
-        let name = String::from_utf8(name_bytes.into()).unwrap();
-        let event = Self::new(ffi_event.wd, ffi_event.mask, ffi_event.cookie, name);
+        let event = Self {
+            wd: ffi_event.wd,
+            mask: ffi_event.mask,
+            cookie: ffi_event.cookie,
+            name,
+        };
         (event_end, event)
     }
 }
 
-/// a type that holds buffer returned by `read` that should contain
-/// multiple `InotifyEvent`s
+/// a struct that holds a buffer that should contain `InotifyEvent`'s, the buffer should be
+/// filled by syscall `read` when reading from the inotify descriptor
 #[derive(Debug)]
 pub struct InotifyEventBatch<const N: usize> {
     buffer: [u8; N],
@@ -91,7 +96,7 @@ impl<const N: usize> InotifyEventBatch<N> {
     }
 }
 
-/// iterates over the events found in the given buffer
+/// iterates over the events found in the given buffer returned by syscall `read`
 impl<const N: usize> Iterator for InotifyEventBatch<N> {
     type Item = InotifyEvent;
 
@@ -115,8 +120,13 @@ pub struct Inotify {
 }
 
 impl Inotify {
+    pub fn new(self) -> Result<Self, Errno> {
+        Self::with_flags(0)
+    }
+
     /// returns new `Inotify` with `inotify_init1` syscall and passing
-    /// the `flags` to the syscall
+    /// the `flags` to the syscall, if the syscall returned any error, an
+    /// `Err(Errno)` will be returned
     pub fn with_flags(flags: i32) -> Result<Self, Errno> {
         match unsafe { ffi::inotify_init1(flags) } {
             SYSCALL_ERROR => Err(Errno::last()),
@@ -145,33 +155,13 @@ impl Inotify {
         }
     }
 
-    /// this function is for directories, since I notify is not recursive
-    /// listening for events on directories won't trigger events for sub directories
-    /// the depth arguments defines how deep the recurse the given directory, if None is given
-    /// then there is no limit
-    pub fn watch_recursive(mut self, pathname: PathBuf, depth: Option<u32>) -> Result<Self, Errno> {
-        if !pathname.is_dir() {
-            return Err(Errno::from(0));
-        }
-        for entry in pathname.read_dir().expect("couldn't read directory") {
-            match entry {
-                Ok(entry) if entry.path().is_dir() => {
-                    // add the directory to the watch list and decrease the depths by one
-                    self = self.watch_recursive(entry.path(), depth.and_then(|n| Some(n - 1)))?;
-                }
-                _ => todo!(),
-            }
-        }
-        Ok(self)
-    }
-
     /// returns the defined path for given watch descriptor
     pub fn path_for_watch(&self, wd: RawFd) -> Option<&Path> {
         self.watchers.get(&wd).and_then(|p| Some(p.as_path()))
     }
 
     /// checks if event is ready on the inotify descriptor by using the
-    /// `poll` syscall
+    /// `poll` syscall, if `poll` returned any error, `Err(Errno)` will be returned
     fn events_ready(&self) -> Result<bool, Errno> {
         let mut fds = [ffi::pollfd {
             fd: self.fd,
@@ -194,6 +184,13 @@ impl Inotify {
 impl Stream for Inotify {
     type Item = Result<InotifyEventBatch<4096>, Errno>;
 
+    /// pull next never returns `None`, will always return some event (if ready), the check
+    /// for event is made via syscall `poll` to check the current inotify descriptor, when
+    /// `poll` returns that there are events ready, the events are pulled to a buffer with fixed
+    /// size of 4096 bytes.
+    ///
+    /// the InotifyEventBatch will be responsible for reading the events from the given
+    /// buffer.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let events_ready = self.events_ready();
 
@@ -201,10 +198,15 @@ impl Stream for Inotify {
             return Poll::Ready(Some(Err(unsafe { events_ready.unwrap_err_unchecked() })));
         }
 
+        // if the `event_ready` was not returned when we cheked if its an error
+        // then its a `Ok(bool)`, and we check if the returned value is `false` (there are no
+        // events) we mark the `poll_next` as still pending
         if !unsafe { events_ready.unwrap_unchecked() } {
             return Poll::Pending;
         }
 
+        // create local buffer with fixed size 4096 and read
+        // all that can fit into the buffer with the `read` syscall
         let mut buffer = [0u8; 4096];
         let bytes_read = unsafe { ffi::read(self.fd, buffer.as_mut_ptr(), buffer.len()) };
 
@@ -229,10 +231,10 @@ impl fmt::Octal for Inotify {
     }
 }
 
-/// clean all resources when inotify is dropped, also drop the watchers
+/// syscall `close` on the inotify descriptor, all inotify watchers
+/// should also be freed acorrding to the documentation
 impl Drop for Inotify {
     fn drop(&mut self) {
-        self.watchers.drain();
         unsafe {
             ffi::close(self.fd);
         }
